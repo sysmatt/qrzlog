@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Interact with the QRZ Logbook API — upload or download ADIF logs."""
+
+import argparse
+import configparser
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+QRZ_API_URL = "https://logbook.qrz.com/api"
+DEFAULT_CONFIG = os.path.expanduser("~/.config/qrzlog/qrzlog.ini")
+
+
+def load_config(config_path: str) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    return cfg
+
+
+def resolve_api_key(args, cfg: configparser.ConfigParser) -> str | None:
+    """Precedence: --key flag > QRZ_API_KEY env var > config file."""
+    if args.key:
+        return args.key
+    if os.environ.get("QRZ_API_KEY"):
+        return os.environ["QRZ_API_KEY"]
+    if cfg.has_option("qrzlog", "api_key"):
+        return cfg.get("qrzlog", "api_key")
+    return None
+
+
+def qrz_post(params: dict) -> str:
+    payload = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(QRZ_API_URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        print(f"HTTP error {e.code}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_response(body: str) -> dict:
+    """Parse a QRZ API response.
+
+    Responses are &-separated key=value pairs. ADIF, when present, is always
+    the last field and is extracted by finding its marker in the raw body so
+    that records on continuation lines are not lost.
+    """
+    result = {}
+    body = body.strip()
+    prefix = body
+
+    # ADIF is always last — find it before any &/newline splitting.
+    # Inline format: ...&ADIF=<content spanning to end>
+    amp_adif = body.upper().find("&ADIF=")
+    if amp_adif != -1:
+        prefix = body[:amp_adif]
+        result["ADIF"] = body[amp_adif + 6:]
+    else:
+        # Line-oriented format: a line that begins with ADIF=
+        for i, line in enumerate(body.splitlines()):
+            if line.upper().startswith("ADIF="):
+                prefix = "\n".join(body.splitlines()[:i])
+                result["ADIF"] = "\n".join(body.splitlines()[i:])[5:]
+                break
+
+    for segment in prefix.replace("\n", "&").split("&"):
+        segment = segment.strip()
+        if "=" in segment:
+            k, v = segment.split("=", 1)
+            k = k.strip()
+            if k and k.upper() != "ADIF":
+                result[k] = urllib.parse.unquote(v.strip())
+
+    return result
+
+
+def check_result(result: dict) -> None:
+    status = result.get("RESULT", "UNKNOWN")
+    if status == "AUTH":
+        print("Authentication failed — check your API key.", file=sys.stderr)
+        sys.exit(1)
+    if status == "FAIL":
+        print(f"Request failed: {result.get('REASON', 'unknown reason')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def do_upload(api_key: str, adif_file: str, dry_run: bool) -> None:
+    try:
+        with open(adif_file, "r", encoding="utf-8", errors="replace") as f:
+            adif_data = f.read()
+    except FileNotFoundError:
+        print(f"File not found: {adif_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if not adif_data.strip():
+        print("ADIF file is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    if dry_run:
+        print(f"[dry-run] Would upload {len(adif_data)} bytes to {QRZ_API_URL}")
+        print(adif_data[:500] + ("..." if len(adif_data) > 500 else ""))
+        return
+
+    body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_data})
+    result = parse_response(body)
+    check_result(result)
+
+    if result.get("RESULT") == "OK":
+        print(f"Success: {result.get('COUNT', '?')} QSO(s) uploaded.")
+    else:
+        print(f"Unexpected response: {body}", file=sys.stderr)
+        sys.exit(1)
+
+
+FETCH_PAGE_SIZE = 250
+
+
+def _strip_adif_header(adif: str) -> str:
+    """Remove the ADIF header (everything up to and including <EOH>) if present."""
+    idx = adif.upper().find("<EOH>")
+    if idx == -1:
+        return adif
+    return adif[idx + 5:].lstrip()
+
+
+def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[dry-run] Would fetch full log (paginated, {FETCH_PAGE_SIZE}/page) "
+              f"from {QRZ_API_URL} and save to {output_file}")
+        return
+
+    chunks: list[str] = []
+    after_logid = 0
+    total = 0
+
+    while True:
+        option = f"MAX:{FETCH_PAGE_SIZE},AFTERLOGID:{after_logid}"
+        print(f"Fetching records after logid {after_logid}...", file=sys.stderr)
+        body = qrz_post({"KEY": api_key, "ACTION": "FETCH", "OPTION": option})
+        result = parse_response(body)
+        check_result(result)
+
+        if result.get("RESULT") != "OK":
+            print(f"Unexpected response: {body}", file=sys.stderr)
+            sys.exit(1)
+
+        adif_chunk = result.get("ADIF", "").strip()
+        try:
+            count = int(result.get("COUNT", "0") or "0")
+        except ValueError:
+            count = 0
+
+        if not adif_chunk or count == 0:
+            break
+
+        # Only the first page keeps its ADIF header; subsequent pages drop it
+        if chunks:
+            adif_chunk = _strip_adif_header(adif_chunk)
+
+        chunks.append(adif_chunk)
+        total += count
+
+        if count < FETCH_PAGE_SIZE:
+            break
+
+        # Advance the cursor to the highest LOGID seen in this page
+        logids = [int(m) for m in re.findall(r"<LOGID:\d+>(\d+)", adif_chunk, re.IGNORECASE)]
+        if not logids:
+            print("Warning: no LOGID fields in ADIF; cannot paginate further.", file=sys.stderr)
+            break
+        after_logid = max(logids)
+
+    if not chunks:
+        print("No QSOs found in log.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(chunks))
+    print(f"Downloaded {total} QSO(s) to {output_file}")
+
+
+def do_save_config(config_path: str, api_key: str) -> None:
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    if not cfg.has_section("qrzlog"):
+        cfg.add_section("qrzlog")
+    cfg.set("qrzlog", "api_key", api_key)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w") as f:
+        cfg.write(f)
+    os.chmod(config_path, 0o600)
+    print(f"API key saved to {config_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="qrzlog",
+        description="Upload or download ADIF logs via the QRZ Logbook API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "API key: QRZ.com -> Logbook -> Settings -> API Key\n\n"
+            "Config file format (~/.config/qrzlog/qrzlog.ini):\n"
+            "  [qrzlog]\n"
+            "  api_key = YOUR_KEY_HERE\n\n"
+            "Examples:\n"
+            "  qrzlog --save-key ABC123XYZ\n"
+            "  qrzlog --upload contacts.adif\n"
+            "  qrzlog --download mylog.adif\n"
+            "  qrzlog --upload contacts.adif --key ABC123XYZ\n"
+            "  qrzlog --download mylog.adif --dry-run"
+        ),
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--upload", metavar="FILE", help="Upload an ADIF file to QRZ Logbook")
+    mode.add_argument("--download", metavar="FILE", help="Download your complete QRZ log to FILE")
+    mode.add_argument("--save-key", metavar="API_KEY", help="Save API key to config file and exit")
+
+    parser.add_argument("--key", metavar="API_KEY", help="QRZ API key (overrides config and QRZ_API_KEY env var)")
+    parser.add_argument(
+        "--config", metavar="FILE", default=DEFAULT_CONFIG,
+        help=f"Config file path (default: {DEFAULT_CONFIG})"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without making any requests")
+
+    args = parser.parse_args()
+
+    if args.save_key:
+        do_save_config(args.config, args.save_key)
+        return
+
+    cfg = load_config(args.config)
+    api_key = resolve_api_key(args, cfg)
+
+    if not api_key and not args.dry_run:
+        parser.error(
+            "No API key found. Use --key, set QRZ_API_KEY, or run:\n"
+            f"  qrzlog --save-key YOUR_KEY  (saves to {args.config})"
+        )
+
+    if args.upload:
+        do_upload(api_key or "", args.upload, args.dry_run)
+    elif args.download:
+        do_download(api_key or "", args.download, args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
