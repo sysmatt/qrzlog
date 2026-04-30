@@ -3,6 +3,7 @@
 
 import argparse
 import configparser
+import html
 import os
 import re
 import sys
@@ -62,13 +63,13 @@ def parse_response(body: str) -> dict:
     amp_adif = body.upper().find("&ADIF=")
     if amp_adif != -1:
         prefix = body[:amp_adif]
-        result["ADIF"] = body[amp_adif + 6:]
+        result["ADIF"] = html.unescape(body[amp_adif + 6:])
     else:
         # Line-oriented format: a line that begins with ADIF=
         for i, line in enumerate(body.splitlines()):
             if line.upper().startswith("ADIF="):
                 prefix = "\n".join(body.splitlines()[:i])
-                result["ADIF"] = "\n".join(body.splitlines()[i:])[5:]
+                result["ADIF"] = html.unescape("\n".join(body.splitlines()[i:])[5:])
                 break
 
     for segment in prefix.replace("\n", "&").split("&"):
@@ -92,7 +93,7 @@ def check_result(result: dict) -> None:
         sys.exit(1)
 
 
-def do_upload(api_key: str, adif_file: str, dry_run: bool) -> None:
+def do_upload(api_key: str, adif_file: str, dry_run: bool, verbose: bool = False) -> None:
     try:
         with open(adif_file, "r", encoding="utf-8", errors="replace") as f:
             adif_data = f.read()
@@ -109,12 +110,21 @@ def do_upload(api_key: str, adif_file: str, dry_run: bool) -> None:
         print(adif_data[:500] + ("..." if len(adif_data) > 500 else ""))
         return
 
+    if verbose:
+        print(f"[verbose] Uploading {adif_file} ({len(adif_data)} bytes) to {QRZ_API_URL}", file=sys.stderr)
+
     body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_data})
+
+    if verbose:
+        print(f"[verbose] Raw response: {body[:200]}", file=sys.stderr)
+
     result = parse_response(body)
     check_result(result)
 
     if result.get("RESULT") == "OK":
         print(f"Success: {result.get('COUNT', '?')} QSO(s) uploaded.")
+        if verbose:
+            print(f"[verbose] Upload complete — RESULT={result.get('RESULT')} COUNT={result.get('COUNT', '?')}", file=sys.stderr)
     else:
         print(f"Unexpected response: {body}", file=sys.stderr)
         sys.exit(1)
@@ -131,7 +141,7 @@ def _strip_adif_header(adif: str) -> str:
     return adif[idx + 5:].lstrip()
 
 
-def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
+def do_download(api_key: str, output_file: str, dry_run: bool, verbose: bool = False) -> None:
     if dry_run:
         print(f"[dry-run] Would fetch full log (paginated, {FETCH_PAGE_SIZE}/page) "
               f"from {QRZ_API_URL} and save to {output_file}")
@@ -140,11 +150,23 @@ def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
     chunks: list[str] = []
     after_logid = 0
     total = 0
+    page = 0
 
     while True:
         option = f"MAX:{FETCH_PAGE_SIZE},AFTERLOGID:{after_logid}"
-        print(f"Fetching records after logid {after_logid}...", file=sys.stderr)
+        page += 1
+
+        if verbose:
+            print(f"[verbose] Page {page}: FETCH OPTION={option}", file=sys.stderr)
+        else:
+            print(f"Fetching records after logid {after_logid}...", file=sys.stderr)
+
         body = qrz_post({"KEY": api_key, "ACTION": "FETCH", "OPTION": option})
+
+        if verbose:
+            preview = body[:300].replace("\n", " ")
+            print(f"[verbose] Raw response ({len(body)} bytes): {preview}", file=sys.stderr)
+
         result = parse_response(body)
         check_result(result)
 
@@ -158,7 +180,12 @@ def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
         except ValueError:
             count = 0
 
+        if verbose:
+            print(f"[verbose] Page {page}: RESULT={result.get('RESULT')} COUNT={count} ADIF bytes={len(adif_chunk)}", file=sys.stderr)
+
         if not adif_chunk or count == 0:
+            if verbose:
+                print(f"[verbose] No more records — stopping after {page} page(s)", file=sys.stderr)
             break
 
         # Only the first page keeps its ADIF header; subsequent pages drop it
@@ -169,14 +196,19 @@ def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
         total += count
 
         if count < FETCH_PAGE_SIZE:
+            if verbose:
+                print(f"[verbose] Page {page} returned {count} < {FETCH_PAGE_SIZE} — last page", file=sys.stderr)
             break
 
-        # Advance the cursor to the highest LOGID seen in this page
-        logids = [int(m) for m in re.findall(r"<LOGID:\d+>(\d+)", adif_chunk, re.IGNORECASE)]
+        # Advance the cursor to the highest app_qrzlog_logid seen in this page
+        logids = [int(m) for m in re.findall(r"<app_qrzlog_logid:\d+>(\d+)", adif_chunk, re.IGNORECASE)]
         if not logids:
-            print("Warning: no LOGID fields in ADIF; cannot paginate further.", file=sys.stderr)
+            print("Warning: no app_qrzlog_logid fields in ADIF; cannot paginate further.", file=sys.stderr)
             break
         after_logid = max(logids)
+
+        if verbose:
+            print(f"[verbose] Page {page}: logids {min(logids)}–{max(logids)}, total so far {total}, advancing cursor to {after_logid}", file=sys.stderr)
 
     if not chunks:
         print("No QSOs found in log.", file=sys.stderr)
@@ -185,6 +217,8 @@ def do_download(api_key: str, output_file: str, dry_run: bool) -> None:
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(chunks))
     print(f"Downloaded {total} QSO(s) to {output_file}")
+    if verbose:
+        print(f"[verbose] Wrote {sum(len(c) for c in chunks)} bytes across {page} page(s)", file=sys.stderr)
 
 
 def do_save_config(config_path: str, api_key: str) -> None:
@@ -230,6 +264,7 @@ def main():
         help=f"Config file path (default: {DEFAULT_CONFIG})"
     )
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without making any requests")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed request/response and pagination info to stderr")
 
     args = parser.parse_args()
 
@@ -247,9 +282,9 @@ def main():
         )
 
     if args.upload:
-        do_upload(api_key or "", args.upload, args.dry_run)
+        do_upload(api_key or "", args.upload, args.dry_run, args.verbose)
     elif args.download:
-        do_download(api_key or "", args.download, args.dry_run)
+        do_download(api_key or "", args.download, args.dry_run, args.verbose)
 
 
 if __name__ == "__main__":

@@ -59,6 +59,15 @@ qrzlog --download mylog.adif --dry-run
 
 Shows what would happen without making any API requests.
 
+### Verbose
+
+```
+qrzlog --download mylog.adif --verbose
+qrzlog --upload contacts.adif --verbose
+```
+
+Prints detailed tracing to stderr: each page fetch, response size, QSO counts, logid ranges, and pagination cursor advancement.
+
 ### Options
 
 | Flag | Description |
@@ -69,6 +78,7 @@ Shows what would happen without making any API requests.
 | `--key API_KEY` | API key (overrides config and env var) |
 | `--config FILE` | Config file path (default: `~/.config/qrzlog/qrzlog.ini`) |
 | `--dry-run` | Show what would happen without making any requests |
+| `--verbose` | Print detailed request/response and pagination info to stderr |
 
 ## Config file format
 
