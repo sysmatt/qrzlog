@@ -59,14 +59,28 @@ qrzlog --download mylog.adif --dry-run
 
 Shows what would happen without making any API requests.
 
-### Verbose
+### Verbosity levels
+
+Three mutually exclusive flags control how much detail is printed to stderr:
 
 ```
-qrzlog --download mylog.adif --verbose
-qrzlog --upload contacts.adif --verbose
+qrzlog --download mylog.adif --verbose   # page fetches, counts, logid ranges
+qrzlog --download mylog.adif --debug     # adds truncated raw API responses
+qrzlog --download mylog.adif --trace     # adds full untruncated responses
 ```
 
-Prints detailed tracing to stderr: each page fetch, response size, QSO counts, logid ranges, and pagination cursor advancement.
+Verbosity can also be set persistently in the config file (see [logging] below).
+Command-line flags take precedence over the config file.
+
+### Log file and syslog
+
+Output can be mirrored to a log file or syslog in addition to the console.
+Log file and syslog entries include the program name, timestamp, and level prefix.
+
+```
+qrzlog --download mylog.adif --verbose --logfile qrzlog.log
+qrzlog --download mylog.adif --debug --syslog
+```
 
 ### Options
 
@@ -78,11 +92,22 @@ Prints detailed tracing to stderr: each page fetch, response size, QSO counts, l
 | `--key API_KEY` | API key (overrides config and env var) |
 | `--config FILE` | Config file path (default: `~/.config/qrzlog/qrzlog.ini`) |
 | `--dry-run` | Show what would happen without making any requests |
-| `--verbose` | Print detailed request/response and pagination info to stderr |
+| `--verbose` | Show request details and pagination info |
+| `--debug` | Show raw API responses (implies --verbose) |
+| `--trace` | Show full untruncated responses (implies --debug) |
+| `--logfile FILE` | Also write log output to FILE |
+| `--syslog` | Also send log output to syslog |
 
 ## Config file format
 
 ```ini
 [qrzlog]
 api_key = YOUR_KEY_HERE
+
+[logging]
+level   = info      # trace | debug | verbose | info (default: info)
+logfile = /path/to/qrzlog.log
+syslog  = false
 ```
+
+The `[logging]` section is optional. `level` sets the default verbosity without needing a command-line flag. Command-line flags (`--verbose`, `--debug`, `--trace`) always take precedence over the config file.

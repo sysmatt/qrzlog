@@ -4,6 +4,8 @@
 import argparse
 import configparser
 import html
+import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -13,6 +15,156 @@ import urllib.request
 
 QRZ_API_URL = "https://logbook.qrz.com/api"
 DEFAULT_CONFIG = os.path.expanduser("~/.config/qrzlog/qrzlog.ini")
+
+
+# =============================================================================
+# BEGIN APPLOG
+# =============================================================================
+
+class AppLogger:
+    """
+    Application logger with TRACE/VERBOSE/DEBUG/INFO levels and configurable destinations.
+
+    Custom levels:
+        TRACE   =  5   super-verbose full dumps
+        VERBOSE = 15   informative detail beyond normal INFO
+
+    Destinations: console stream (stderr by default), log file, syslog.
+    Console output: plain message for INFO, [LEVEL] prefix for all other levels.
+    File/syslog output: includes program name, timestamp, and level.
+
+    Construction:
+        log = AppLogger("myprog", level=AppLogger.VERBOSE)
+        log = AppLogger.from_args(args, "myprog")
+        log = AppLogger.from_args(args, "myprog", cfg=config)  # args > cfg > defaults
+
+    Config file ([logging] section):
+        [logging]
+        level   = verbose    # trace | debug | verbose | info
+        logfile = /path/to/myprog.log
+        syslog  = false
+    """
+
+    TRACE   = 5
+    VERBOSE = 15
+
+    # Register custom levels at class-definition time
+    logging.addLevelName(TRACE,   "TRACE")
+    logging.addLevelName(VERBOSE, "VERBOSE")
+
+    # Inject .trace() and .verbose() into logging.Logger
+    def _trace_m(self, msg, *a, **kw):
+        if self.isEnabledFor(5):  self._log(5,  msg, a, **kw)
+    def _verbose_m(self, msg, *a, **kw):
+        if self.isEnabledFor(15): self._log(15, msg, a, **kw)
+    logging.Logger.trace   = _trace_m
+    logging.Logger.verbose = _verbose_m
+    del _trace_m, _verbose_m
+
+    class _ConsoleFormatter(logging.Formatter):
+        """Plain message for INFO; [LEVEL] prefix for everything else."""
+        def __init__(self, plain_levels=None):
+            super().__init__()
+            self._plain = frozenset(plain_levels if plain_levels is not None else [logging.INFO])
+
+        def format(self, record):
+            msg = record.getMessage()
+            if record.levelno not in self._plain:
+                msg = f"[{record.levelname}] {msg}"
+            if record.exc_info:
+                if not record.exc_text:
+                    record.exc_text = self.formatException(record.exc_info)
+            if record.exc_text:
+                msg = f"{msg}\n{record.exc_text}"
+            return msg
+
+    def __init__(
+        self,
+        name: str,
+        level: int = logging.INFO,
+        *,
+        stream=sys.stderr,
+        logfile: str | None = None,
+        use_syslog: bool = False,
+        plain_levels: list[int] | None = None,
+    ):
+        self._logger = logging.getLogger(name)
+        self._logger.setLevel(level)
+        self._logger.handlers.clear()
+        self._logger.propagate = False
+
+        if stream is not None:
+            h = logging.StreamHandler(stream)
+            h.setLevel(level)
+            h.setFormatter(self._ConsoleFormatter(plain_levels=plain_levels))
+            self._logger.addHandler(h)
+
+        if logfile:
+            h = logging.FileHandler(logfile, encoding="utf-8")
+            h.setLevel(level)
+            h.setFormatter(logging.Formatter(
+                fmt=f"%(asctime)s {name} [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            self._logger.addHandler(h)
+
+        if use_syslog:
+            address = "/dev/log" if os.path.exists("/dev/log") else ("localhost", 514)
+            h = logging.handlers.SysLogHandler(address=address)
+            h.setLevel(level)
+            h.setFormatter(logging.Formatter(f"{name}: [%(levelname)s] %(message)s"))
+            self._logger.addHandler(h)
+
+    @classmethod
+    def from_args(
+        cls,
+        args,
+        program_name: str,
+        cfg: configparser.ConfigParser | None = None,
+        **kwargs,
+    ) -> "AppLogger":
+        """
+        Build from an argparse Namespace, optionally merging a ConfigParser.
+        Args take precedence over the [logging] config section.
+
+        Namespace attrs read (all optional):
+            trace, debug, verbose  log level — most verbose flag wins
+            logfile                log file path
+            syslog                 enable syslog
+
+        ConfigParser [logging] keys (used when the corresponding arg is absent):
+            level   = trace | debug | verbose | info
+            logfile = /path/to/file
+            syslog  = true | false
+        """
+        _lvl = {"trace": cls.TRACE, "debug": logging.DEBUG,
+                "verbose": cls.VERBOSE, "info": logging.INFO}
+
+        cfg_level   = _lvl.get((cfg.get("logging", "level", fallback="") if cfg else "").lower(), logging.INFO)
+        cfg_logfile = cfg.get("logging", "logfile", fallback=None)        if cfg else None
+        cfg_syslog  = cfg.getboolean("logging", "syslog", fallback=False) if cfg else False
+
+        if   getattr(args, "trace",   False): level = cls.TRACE
+        elif getattr(args, "debug",   False): level = logging.DEBUG
+        elif getattr(args, "verbose", False): level = cls.VERBOSE
+        else:                                 level = cfg_level
+
+        logfile   = getattr(args, "logfile", None) or cfg_logfile
+        use_syslog = getattr(args, "syslog", False) or cfg_syslog
+
+        return cls(name=program_name, level=level, logfile=logfile, use_syslog=use_syslog, **kwargs)
+
+    def trace(self,   msg, *a, **kw): self._logger.trace(msg,   *a, **kw)
+    def verbose(self, msg, *a, **kw): self._logger.verbose(msg, *a, **kw)
+    def debug(self,   msg, *a, **kw): self._logger.debug(msg,   *a, **kw)
+    def info(self,    msg, *a, **kw): self._logger.info(msg,    *a, **kw)
+    def warning(self, msg, *a, **kw): self._logger.warning(msg, *a, **kw)
+    def error(self,   msg, *a, **kw): self._logger.error(msg,   *a, **kw)
+    def critical(self,msg, *a, **kw): self._logger.critical(msg,*a, **kw)
+
+# =============================================================================
+# END APPLOG
+# =============================================================================
 
 
 def load_config(config_path: str) -> configparser.ConfigParser:
@@ -32,7 +184,7 @@ def resolve_api_key(args, cfg: configparser.ConfigParser) -> str | None:
     return None
 
 
-def qrz_post(params: dict) -> str:
+def qrz_post(params: dict, log: AppLogger) -> str:
     payload = urllib.parse.urlencode(params).encode("utf-8")
     req = urllib.request.Request(QRZ_API_URL, data=payload, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -40,10 +192,10 @@ def qrz_post(params: dict) -> str:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        print(f"HTTP error {e.code}: {e.reason}", file=sys.stderr)
+        log.error("HTTP error %d: %s", e.code, e.reason)
         sys.exit(1)
     except urllib.error.URLError as e:
-        print(f"Connection error: {e.reason}", file=sys.stderr)
+        log.error("Connection error: %s", e.reason)
         sys.exit(1)
 
 
@@ -59,13 +211,11 @@ def parse_response(body: str) -> dict:
     prefix = body
 
     # ADIF is always last — find it before any &/newline splitting.
-    # Inline format: ...&ADIF=<content spanning to end>
     amp_adif = body.upper().find("&ADIF=")
     if amp_adif != -1:
         prefix = body[:amp_adif]
         result["ADIF"] = html.unescape(body[amp_adif + 6:])
     else:
-        # Line-oriented format: a line that begins with ADIF=
         for i, line in enumerate(body.splitlines()):
             if line.upper().startswith("ADIF="):
                 prefix = "\n".join(body.splitlines()[:i])
@@ -83,50 +233,45 @@ def parse_response(body: str) -> dict:
     return result
 
 
-def check_result(result: dict) -> None:
+def check_result(result: dict, log: AppLogger) -> None:
     status = result.get("RESULT", "UNKNOWN")
     if status == "AUTH":
-        print("Authentication failed — check your API key.", file=sys.stderr)
+        log.error("Authentication failed — check your API key.")
         sys.exit(1)
     if status == "FAIL":
-        print(f"Request failed: {result.get('REASON', 'unknown reason')}", file=sys.stderr)
+        log.error("Request failed: %s", result.get("REASON", "unknown reason"))
         sys.exit(1)
 
 
-def do_upload(api_key: str, adif_file: str, dry_run: bool, verbose: bool = False) -> None:
+def do_upload(api_key: str, adif_file: str, dry_run: bool, log: AppLogger) -> None:
     try:
         with open(adif_file, "r", encoding="utf-8", errors="replace") as f:
             adif_data = f.read()
     except FileNotFoundError:
-        print(f"File not found: {adif_file}", file=sys.stderr)
+        log.error("File not found: %s", adif_file)
         sys.exit(1)
 
     if not adif_data.strip():
-        print("ADIF file is empty.", file=sys.stderr)
+        log.error("ADIF file is empty.")
         sys.exit(1)
 
     if dry_run:
-        print(f"[dry-run] Would upload {len(adif_data)} bytes to {QRZ_API_URL}")
-        print(adif_data[:500] + ("..." if len(adif_data) > 500 else ""))
+        log.info("[dry-run] Would upload %d bytes to %s", len(adif_data), QRZ_API_URL)
+        log.info("%s%s", adif_data[:500], "..." if len(adif_data) > 500 else "")
         return
 
-    if verbose:
-        print(f"[verbose] Uploading {adif_file} ({len(adif_data)} bytes) to {QRZ_API_URL}", file=sys.stderr)
-
-    body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_data})
-
-    if verbose:
-        print(f"[verbose] Raw response: {body[:200]}", file=sys.stderr)
+    log.verbose("Uploading %s (%d bytes) to %s", adif_file, len(adif_data), QRZ_API_URL)
+    body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_data}, log)
+    log.debug("Raw response: %s", body[:300])
+    log.trace("Full raw response: %s", body)
 
     result = parse_response(body)
-    check_result(result)
+    check_result(result, log)
 
     if result.get("RESULT") == "OK":
-        print(f"Success: {result.get('COUNT', '?')} QSO(s) uploaded.")
-        if verbose:
-            print(f"[verbose] Upload complete — RESULT={result.get('RESULT')} COUNT={result.get('COUNT', '?')}", file=sys.stderr)
+        log.info("Success: %s QSO(s) uploaded.", result.get("COUNT", "?"))
     else:
-        print(f"Unexpected response: {body}", file=sys.stderr)
+        log.error("Unexpected response: %s", body)
         sys.exit(1)
 
 
@@ -141,10 +286,10 @@ def _strip_adif_header(adif: str) -> str:
     return adif[idx + 5:].lstrip()
 
 
-def do_download(api_key: str, output_file: str, dry_run: bool, verbose: bool = False) -> None:
+def do_download(api_key: str, output_file: str, dry_run: bool, log: AppLogger) -> None:
     if dry_run:
-        print(f"[dry-run] Would fetch full log (paginated, {FETCH_PAGE_SIZE}/page) "
-              f"from {QRZ_API_URL} and save to {output_file}")
+        log.info("[dry-run] Would fetch full log (paginated, %d/page) from %s and save to %s",
+                 FETCH_PAGE_SIZE, QRZ_API_URL, output_file)
         return
 
     chunks: list[str] = []
@@ -156,22 +301,18 @@ def do_download(api_key: str, output_file: str, dry_run: bool, verbose: bool = F
         option = f"MAX:{FETCH_PAGE_SIZE},AFTERLOGID:{after_logid}"
         page += 1
 
-        if verbose:
-            print(f"[verbose] Page {page}: FETCH OPTION={option}", file=sys.stderr)
-        else:
-            print(f"Fetching records after logid {after_logid}...", file=sys.stderr)
+        log.info("Fetching page %d (after logid %d)...", page, after_logid)
+        log.verbose("Page %d: FETCH OPTION=%s", page, option)
 
-        body = qrz_post({"KEY": api_key, "ACTION": "FETCH", "OPTION": option})
-
-        if verbose:
-            preview = body[:300].replace("\n", " ")
-            print(f"[verbose] Raw response ({len(body)} bytes): {preview}", file=sys.stderr)
+        body = qrz_post({"KEY": api_key, "ACTION": "FETCH", "OPTION": option}, log)
+        log.debug("Page %d raw response (%d bytes): %s", page, len(body), body[:300].replace("\n", " "))
+        log.trace("Page %d full response: %s", page, body)
 
         result = parse_response(body)
-        check_result(result)
+        check_result(result, log)
 
         if result.get("RESULT") != "OK":
-            print(f"Unexpected response: {body}", file=sys.stderr)
+            log.error("Unexpected response: %s", body)
             sys.exit(1)
 
         adif_chunk = result.get("ADIF", "").strip()
@@ -180,12 +321,11 @@ def do_download(api_key: str, output_file: str, dry_run: bool, verbose: bool = F
         except ValueError:
             count = 0
 
-        if verbose:
-            print(f"[verbose] Page {page}: RESULT={result.get('RESULT')} COUNT={count} ADIF bytes={len(adif_chunk)}", file=sys.stderr)
+        log.verbose("Page %d: RESULT=%s COUNT=%d ADIF bytes=%d",
+                    page, result.get("RESULT"), count, len(adif_chunk))
 
         if not adif_chunk or count == 0:
-            if verbose:
-                print(f"[verbose] No more records — stopping after {page} page(s)", file=sys.stderr)
+            log.verbose("No more records — stopping after %d page(s)", page)
             break
 
         # Only the first page keeps its ADIF header; subsequent pages drop it
@@ -196,29 +336,26 @@ def do_download(api_key: str, output_file: str, dry_run: bool, verbose: bool = F
         total += count
 
         if count < FETCH_PAGE_SIZE:
-            if verbose:
-                print(f"[verbose] Page {page} returned {count} < {FETCH_PAGE_SIZE} — last page", file=sys.stderr)
+            log.verbose("Page %d returned %d < %d — last page", page, count, FETCH_PAGE_SIZE)
             break
 
         # Advance the cursor to the highest app_qrzlog_logid seen in this page
         logids = [int(m) for m in re.findall(r"<app_qrzlog_logid:\d+>(\d+)", adif_chunk, re.IGNORECASE)]
         if not logids:
-            print("Warning: no app_qrzlog_logid fields in ADIF; cannot paginate further.", file=sys.stderr)
+            log.warning("No app_qrzlog_logid fields in ADIF; cannot paginate further.")
             break
         after_logid = max(logids)
-
-        if verbose:
-            print(f"[verbose] Page {page}: logids {min(logids)}–{max(logids)}, total so far {total}, advancing cursor to {after_logid}", file=sys.stderr)
+        log.verbose("Page %d: logids %d–%d, total so far %d, advancing cursor to %d",
+                    page, min(logids), max(logids), total, after_logid)
 
     if not chunks:
-        print("No QSOs found in log.", file=sys.stderr)
+        log.error("No QSOs found in log.")
         sys.exit(1)
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(chunks))
-    print(f"Downloaded {total} QSO(s) to {output_file}")
-    if verbose:
-        print(f"[verbose] Wrote {sum(len(c) for c in chunks)} bytes across {page} page(s)", file=sys.stderr)
+    log.info("Downloaded %d QSO(s) to %s", total, output_file)
+    log.verbose("Wrote %d bytes across %d page(s)", sum(len(c) for c in chunks), page)
 
 
 def do_save_config(config_path: str, api_key: str) -> None:
@@ -244,35 +381,49 @@ def main():
             "Config file format (~/.config/qrzlog/qrzlog.ini):\n"
             "  [qrzlog]\n"
             "  api_key = YOUR_KEY_HERE\n\n"
+            "  [logging]\n"
+            "  level   = verbose    # trace | debug | verbose | info\n"
+            "  logfile = /path/to/qrzlog.log\n"
+            "  syslog  = false\n\n"
             "Examples:\n"
             "  qrzlog --save-key ABC123XYZ\n"
             "  qrzlog --upload contacts.adif\n"
             "  qrzlog --download mylog.adif\n"
+            "  qrzlog --download mylog.adif --verbose\n"
+            "  qrzlog --download mylog.adif --debug --logfile qrzlog.log\n"
             "  qrzlog --upload contacts.adif --key ABC123XYZ\n"
             "  qrzlog --download mylog.adif --dry-run"
         ),
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--upload", metavar="FILE", help="Upload an ADIF file to QRZ Logbook")
-    mode.add_argument("--download", metavar="FILE", help="Download your complete QRZ log to FILE")
+    mode.add_argument("--upload",   metavar="FILE",    help="Upload an ADIF file to QRZ Logbook")
+    mode.add_argument("--download", metavar="FILE",    help="Download your complete QRZ log to FILE")
     mode.add_argument("--save-key", metavar="API_KEY", help="Save API key to config file and exit")
 
-    parser.add_argument("--key", metavar="API_KEY", help="QRZ API key (overrides config and QRZ_API_KEY env var)")
-    parser.add_argument(
-        "--config", metavar="FILE", default=DEFAULT_CONFIG,
-        help=f"Config file path (default: {DEFAULT_CONFIG})"
-    )
+    parser.add_argument("--key",    metavar="API_KEY", help="QRZ API key (overrides config and QRZ_API_KEY env var)")
+    parser.add_argument("--config", metavar="FILE", default=DEFAULT_CONFIG,
+                        help=f"Config file path (default: {DEFAULT_CONFIG})")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without making any requests")
-    parser.add_argument("--verbose", action="store_true", help="Print detailed request/response and pagination info to stderr")
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument("--verbose", action="store_true", help="Show request details and pagination info")
+    verbosity.add_argument("--debug",   action="store_true", help="Show raw API responses (implies --verbose)")
+    verbosity.add_argument("--trace",   action="store_true", help="Show full untruncated responses (implies --debug)")
+
+    parser.add_argument("--logfile", metavar="FILE",  help="Also write log output to FILE")
+    parser.add_argument("--syslog",  action="store_true", help="Also send log output to syslog")
 
     args = parser.parse_args()
+
+    # Load config early so logging options can be read from [logging] section
+    cfg = load_config(args.config)
+    log = AppLogger.from_args(args, "qrzlog", cfg=cfg)
 
     if args.save_key:
         do_save_config(args.config, args.save_key)
         return
 
-    cfg = load_config(args.config)
     api_key = resolve_api_key(args, cfg)
 
     if not api_key and not args.dry_run:
@@ -282,9 +433,9 @@ def main():
         )
 
     if args.upload:
-        do_upload(api_key or "", args.upload, args.dry_run, args.verbose)
+        do_upload(api_key or "", args.upload, args.dry_run, log)
     elif args.download:
-        do_download(api_key or "", args.download, args.dry_run, args.verbose)
+        do_download(api_key or "", args.download, args.dry_run, log)
 
 
 if __name__ == "__main__":
