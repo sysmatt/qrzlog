@@ -40,7 +40,30 @@ Precedence: `--key` flag > `QRZ_API_KEY` environment variable > config file.
 qrzlog --upload contacts.adif
 ```
 
-Inserts all QSOs from the ADIF file into your QRZ logbook.
+Inserts QSOs from an ADIF file into your QRZ logbook. The file is parsed into
+individual records and sent in chunks (default 100 QSOs each) to avoid hitting
+server-side request size limits. Use `--upload-chunk-size` to tune the batch size.
+
+```
+qrzlog --upload contacts.adif --upload-chunk-size 50
+```
+
+To upload only a recent subset of a large log file:
+
+```
+qrzlog --upload contacts.adif --tail 100         # last 100 QSOs
+qrzlog --upload contacts.adif --tail-days 7      # QSOs from the last 7 days
+```
+
+`--tail` and `--tail-days` are mutually exclusive. Records with no parseable
+`QSO_DATE` field are always kept when `--tail-days` is used (a warning is printed).
+
+Use `--dry-run --trace` to preview exactly which records would be in each chunk
+before sending anything:
+
+```
+qrzlog --upload contacts.adif --tail-days 30 --dry-run --trace
+```
 
 ### Download
 
@@ -97,6 +120,9 @@ qrzlog --download mylog.adif --debug --syslog
 | `--trace` | Show full untruncated responses (implies --debug) |
 | `--logfile FILE` | Also write log output to FILE |
 | `--syslog` | Also send log output to syslog |
+| `--upload-chunk-size N` | QSOs per upload chunk (default: 100) |
+| `--tail N` | Upload only the last N QSOs (upload only) |
+| `--tail-days N` | Upload only QSOs from the last N days (upload only) |
 
 ## Config file format
 

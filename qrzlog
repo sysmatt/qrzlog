@@ -3,6 +3,7 @@
 
 import argparse
 import configparser
+from datetime import date, timedelta
 import html
 import logging
 import logging.handlers
@@ -15,6 +16,7 @@ import urllib.request
 
 QRZ_API_URL = "https://logbook.qrz.com/api"
 DEFAULT_CONFIG = os.path.expanduser("~/.config/qrzlog/qrzlog.ini")
+DEFAULT_UPLOAD_CHUNK_SIZE = 100
 
 
 # =============================================================================
@@ -149,7 +151,7 @@ class AppLogger:
         elif getattr(args, "verbose", False): level = cls.VERBOSE
         else:                                 level = cfg_level
 
-        logfile   = getattr(args, "logfile", None) or cfg_logfile
+        logfile    = getattr(args, "logfile", None) or cfg_logfile
         use_syslog = getattr(args, "syslog", False) or cfg_syslog
 
         return cls(name=program_name, level=level, logfile=logfile, use_syslog=use_syslog, **kwargs)
@@ -243,7 +245,49 @@ def check_result(result: dict, log: AppLogger) -> None:
         sys.exit(1)
 
 
-def do_upload(api_key: str, adif_file: str, dry_run: bool, log: AppLogger) -> None:
+def _parse_adif_records(adif_data: str) -> tuple[str, list[str]]:
+    """Split raw ADIF text into (header, [record, ...]).
+
+    The header is everything up to and including <EOH> (empty string if absent).
+    Each record string includes its trailing <EOR> tag.
+    """
+    eoh_idx = adif_data.upper().find("<EOH>")
+    if eoh_idx != -1:
+        header = adif_data[:eoh_idx + 5]
+        body   = adif_data[eoh_idx + 5:]
+    else:
+        header = ""
+        body   = adif_data
+
+    records = []
+    for part in re.split(r"<EOR>", body, flags=re.IGNORECASE):
+        r = part.strip()
+        if r:
+            records.append(r + "\n<EOR>")
+    return header, records
+
+
+def _adif_qso_date(record: str) -> str:
+    """Return the QSO_DATE value (YYYYMMDD) from a record, or empty string."""
+    m = re.search(r"<QSO_DATE:\d+>(\d{8})", record, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _build_adif_chunk(header: str, records: list[str]) -> str:
+    """Reassemble a valid ADIF string from a header and a list of record strings."""
+    parts = ([header] if header else []) + records
+    return "\n".join(parts)
+
+
+def do_upload(
+    api_key: str,
+    adif_file: str,
+    dry_run: bool,
+    log: AppLogger,
+    chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE,
+    tail: int | None = None,
+    tail_days: int | None = None,
+) -> None:
     try:
         with open(adif_file, "r", encoding="utf-8", errors="replace") as f:
             adif_data = f.read()
@@ -255,24 +299,76 @@ def do_upload(api_key: str, adif_file: str, dry_run: bool, log: AppLogger) -> No
         log.error("ADIF file is empty.")
         sys.exit(1)
 
+    header, records = _parse_adif_records(adif_data)
+    log.verbose("Parsed %d QSO(s) from %s", len(records), adif_file)
+
+    # Apply filters
+    if tail_days is not None:
+        cutoff = (date.today() - timedelta(days=tail_days)).strftime("%Y%m%d")
+        before = len(records)
+        filtered, no_date = [], 0
+        for r in records:
+            d = _adif_qso_date(r)
+            if not d:
+                no_date += 1
+                filtered.append(r)  # keep records with no parseable QSO_DATE
+            elif d >= cutoff:
+                filtered.append(r)
+        if no_date:
+            log.warning("%d QSO(s) had no parseable QSO_DATE and were kept without date filtering", no_date)
+        records = filtered
+        log.verbose("--tail-days %d: kept %d of %d QSO(s) on or after %s",
+                    tail_days, len(records), before, cutoff)
+
+    if tail is not None:
+        before = len(records)
+        records = records[-tail:]
+        log.verbose("--tail %d: kept last %d of %d QSO(s)", tail, len(records), before)
+
+    if not records:
+        log.error("No QSOs to upload after filtering.")
+        sys.exit(1)
+
+    # Split into chunks; only the first chunk gets the original header
+    chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
+    n_chunks = len(chunks)
+
     if dry_run:
-        log.info("[dry-run] Would upload %d bytes to %s", len(adif_data), QRZ_API_URL)
-        log.info("%s%s", adif_data[:500], "..." if len(adif_data) > 500 else "")
+        log.info("[dry-run] Would upload %d QSO(s) in %d chunk(s) of up to %d to %s",
+                 len(records), n_chunks, chunk_size, QRZ_API_URL)
+        for i, chunk_records in enumerate(chunks):
+            adif_chunk = _build_adif_chunk(header if i == 0 else "", chunk_records)
+            log.verbose("[dry-run] Chunk %d/%d: %d QSO(s), %d bytes",
+                        i + 1, n_chunks, len(chunk_records), len(adif_chunk))
+            log.trace("[dry-run] Chunk %d/%d content:\n%s", i + 1, n_chunks, adif_chunk)
         return
 
-    log.verbose("Uploading %s (%d bytes) to %s", adif_file, len(adif_data), QRZ_API_URL)
-    body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_data}, log)
-    log.debug("Raw response: %s", body[:300])
-    log.trace("Full raw response: %s", body)
+    uploaded = 0
+    for i, chunk_records in enumerate(chunks):
+        adif_chunk = _build_adif_chunk(header if i == 0 else "", chunk_records)
+        log.info("Uploading chunk %d/%d (%d QSOs)...", i + 1, n_chunks, len(chunk_records))
+        log.verbose("Chunk %d/%d: %d bytes", i + 1, n_chunks, len(adif_chunk))
+        log.trace("Chunk %d/%d content:\n%s", i + 1, n_chunks, adif_chunk)
 
-    result = parse_response(body)
-    check_result(result, log)
+        body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_chunk}, log)
+        log.debug("Chunk %d/%d response: %s", i + 1, n_chunks, body[:300])
+        log.trace("Chunk %d/%d full response: %s", i + 1, n_chunks, body)
 
-    if result.get("RESULT") == "OK":
-        log.info("Success: %s QSO(s) uploaded.", result.get("COUNT", "?"))
-    else:
-        log.error("Unexpected response: %s", body)
-        sys.exit(1)
+        result = parse_response(body)
+        check_result(result, log)
+
+        if result.get("RESULT") == "OK":
+            count = result.get("COUNT", "?")
+            log.verbose("Chunk %d/%d: %s QSO(s) accepted", i + 1, n_chunks, count)
+            try:
+                uploaded += int(count)
+            except (ValueError, TypeError):
+                pass
+        else:
+            log.error("Unexpected response for chunk %d/%d: %s", i + 1, n_chunks, body)
+            sys.exit(1)
+
+    log.info("Success: %d QSO(s) uploaded in %d chunk(s).", uploaded or len(records), n_chunks)
 
 
 FETCH_PAGE_SIZE = 250
@@ -388,6 +484,9 @@ def main():
             "Examples:\n"
             "  qrzlog --save-key ABC123XYZ\n"
             "  qrzlog --upload contacts.adif\n"
+            "  qrzlog --upload contacts.adif --tail 50\n"
+            "  qrzlog --upload contacts.adif --tail-days 7\n"
+            "  qrzlog --upload contacts.adif --upload-chunk-size 50 --dry-run --trace\n"
             "  qrzlog --download mylog.adif\n"
             "  qrzlog --download mylog.adif --verbose\n"
             "  qrzlog --download mylog.adif --debug --logfile qrzlog.log\n"
@@ -414,7 +513,24 @@ def main():
     parser.add_argument("--logfile", metavar="FILE",  help="Also write log output to FILE")
     parser.add_argument("--syslog",  action="store_true", help="Also send log output to syslog")
 
+    # Upload-specific options
+    parser.add_argument(
+        "--upload-chunk-size", metavar="N", type=int, default=DEFAULT_UPLOAD_CHUNK_SIZE,
+        help=f"QSOs per upload chunk (default: {DEFAULT_UPLOAD_CHUNK_SIZE})",
+    )
+    tail_group = parser.add_mutually_exclusive_group()
+    tail_group.add_argument("--tail",      metavar="N", type=int, help="Upload only the last N QSOs")
+    tail_group.add_argument("--tail-days", metavar="N", type=int, help="Upload only QSOs from the last N days")
+
     args = parser.parse_args()
+
+    # Validate upload-only flags
+    upload_only = {"upload_chunk_size": args.upload_chunk_size != DEFAULT_UPLOAD_CHUNK_SIZE,
+                   "tail": args.tail is not None,
+                   "tail_days": args.tail_days is not None}
+    if any(upload_only.values()) and not args.upload:
+        used = [f"--{k.replace('_', '-')}" for k, v in upload_only.items() if v]
+        parser.error(f"{', '.join(used)} can only be used with --upload")
 
     # Load config early so logging options can be read from [logging] section
     cfg = load_config(args.config)
@@ -433,7 +549,12 @@ def main():
         )
 
     if args.upload:
-        do_upload(api_key or "", args.upload, args.dry_run, log)
+        do_upload(
+            api_key or "", args.upload, args.dry_run, log,
+            chunk_size=args.upload_chunk_size,
+            tail=args.tail,
+            tail_days=args.tail_days,
+        )
     elif args.download:
         do_download(api_key or "", args.download, args.dry_run, log)
 
