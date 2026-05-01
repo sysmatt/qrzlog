@@ -263,7 +263,7 @@ def _parse_adif_records(adif_data: str) -> tuple[str, list[str]]:
     for part in re.split(r"<EOR>", body, flags=re.IGNORECASE):
         r = part.strip()
         if r:
-            records.append(r + "\n<EOR>")
+            records.append(r + " <EOR>")  # keep <EOR> inline, matching QRZ's own format
     return header, records
 
 
@@ -300,7 +300,10 @@ def do_upload(
         sys.exit(1)
 
     header, records = _parse_adif_records(adif_data)
-    log.verbose("Parsed %d QSO(s) from %s", len(records), adif_file)
+    eor_count = len(re.findall(r"<EOR>", adif_data, re.IGNORECASE))
+    if eor_count == 0:
+        log.warning("No <EOR> record terminators found in %s — file may be empty or non-standard ADIF", adif_file)
+    log.verbose("Parsed %d QSO(s) from %s (%d <EOR> tags)", len(records), adif_file, eor_count)
 
     # Apply filters
     if tail_days is not None:
