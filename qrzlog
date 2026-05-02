@@ -14,9 +14,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-QRZ_API_URL = "https://logbook.qrz.com/api"
+QRZ_API_URL   = "https://logbook.qrz.com/api"
 DEFAULT_CONFIG = os.path.expanduser("~/.config/qrzlog/qrzlog.ini")
-DEFAULT_UPLOAD_CHUNK_SIZE = 100
+
+WSJT_X_LOG_CANDIDATES = [
+    os.path.expanduser("~/.local/share/WSJT-X/wsjtx_log.adi"),
+    os.path.expanduser("~/.local/share/WSJT-X/wsjtx_log.adif"),
+]
 
 
 # =============================================================================
@@ -175,6 +179,16 @@ def load_config(config_path: str) -> configparser.ConfigParser:
     return cfg
 
 
+def find_default_log_file(cfg: configparser.ConfigParser | None = None) -> str | None:
+    """Return configured log_file from [qrzlog], or first existing WSJT-X candidate."""
+    if cfg and cfg.has_option("qrzlog", "log_file"):
+        return cfg.get("qrzlog", "log_file")
+    for path in WSJT_X_LOG_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def resolve_api_key(args, cfg: configparser.ConfigParser) -> str | None:
     """Precedence: --key flag > QRZ_API_KEY env var > config file."""
     if args.key:
@@ -249,7 +263,7 @@ def _parse_adif_records(adif_data: str) -> tuple[str, list[str]]:
     """Split raw ADIF text into (header, [record, ...]).
 
     The header is everything up to and including <EOH> (empty string if absent).
-    Each record string includes its trailing <EOR> tag.
+    Each record string includes its trailing <EOR> tag, kept inline.
     """
     eoh_idx = adif_data.upper().find("<EOH>")
     if eoh_idx != -1:
@@ -263,7 +277,7 @@ def _parse_adif_records(adif_data: str) -> tuple[str, list[str]]:
     for part in re.split(r"<EOR>", body, flags=re.IGNORECASE):
         r = part.strip()
         if r:
-            records.append(r + " <EOR>")  # keep <EOR> inline, matching QRZ's own format
+            records.append(r + " <EOR>")
     return header, records
 
 
@@ -273,10 +287,9 @@ def _adif_qso_date(record: str) -> str:
     return m.group(1) if m else ""
 
 
-def _build_adif_chunk(header: str, records: list[str]) -> str:
-    """Reassemble a valid ADIF string from a header and a list of record strings."""
-    parts = ([header] if header else []) + records
-    return "\n".join(parts)
+def _build_adif(header: str, record: str) -> str:
+    """Build a complete single-record ADIF string."""
+    return f"{header}\n{record}" if header else record
 
 
 def do_upload(
@@ -284,7 +297,6 @@ def do_upload(
     adif_file: str,
     dry_run: bool,
     log: AppLogger,
-    chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE,
     tail: int | None = None,
     tail_days: int | None = None,
 ) -> None:
@@ -302,7 +314,7 @@ def do_upload(
     header, records = _parse_adif_records(adif_data)
     eor_count = len(re.findall(r"<EOR>", adif_data, re.IGNORECASE))
     if eor_count == 0:
-        log.warning("No <EOR> record terminators found in %s — file may be empty or non-standard ADIF", adif_file)
+        log.warning("No <EOR> record terminators found in %s — file may be non-standard ADIF", adif_file)
     log.verbose("Parsed %d QSO(s) from %s (%d <EOR> tags)", len(records), adif_file, eor_count)
 
     # Apply filters
@@ -332,46 +344,41 @@ def do_upload(
         log.error("No QSOs to upload after filtering.")
         sys.exit(1)
 
-    # Split into chunks; only the first chunk gets the original header
-    chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
-    n_chunks = len(chunks)
+    n = len(records)
 
     if dry_run:
-        log.info("[dry-run] Would upload %d QSO(s) in %d chunk(s) of up to %d to %s",
-                 len(records), n_chunks, chunk_size, QRZ_API_URL)
-        for i, chunk_records in enumerate(chunks):
-            adif_chunk = _build_adif_chunk(header if i == 0 else "", chunk_records)
-            log.verbose("[dry-run] Chunk %d/%d: %d QSO(s), %d bytes",
-                        i + 1, n_chunks, len(chunk_records), len(adif_chunk))
-            log.trace("[dry-run] Chunk %d/%d content:\n%s", i + 1, n_chunks, adif_chunk)
+        log.info("[dry-run] Would upload %d QSO(s) in %d INSERT call(s) to %s", n, n, QRZ_API_URL)
+        for i, record in enumerate(records):
+            adif = _build_adif(header, record)
+            log.verbose("[dry-run] QSO %d/%d: %d bytes", i + 1, n, len(adif))
+            log.trace("[dry-run] QSO %d/%d content:\n%s", i + 1, n, adif)
         return
 
     uploaded = 0
-    for i, chunk_records in enumerate(chunks):
-        adif_chunk = _build_adif_chunk(header if i == 0 else "", chunk_records)
-        log.info("Uploading chunk %d/%d (%d QSOs)...", i + 1, n_chunks, len(chunk_records))
-        log.verbose("Chunk %d/%d: %d bytes", i + 1, n_chunks, len(adif_chunk))
-        log.trace("Chunk %d/%d content:\n%s", i + 1, n_chunks, adif_chunk)
+    for i, record in enumerate(records):
+        adif = _build_adif(header, record)
+        log.info("Uploading QSO %d/%d...", i + 1, n)
+        log.verbose("QSO %d/%d: %d bytes", i + 1, n, len(adif))
+        log.trace("QSO %d/%d content:\n%s", i + 1, n, adif)
 
-        body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif_chunk}, log)
-        log.debug("Chunk %d/%d response: %s", i + 1, n_chunks, body[:300])
-        log.trace("Chunk %d/%d full response: %s", i + 1, n_chunks, body)
+        body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif}, log)
+        log.debug("QSO %d/%d response: %s", i + 1, n, body[:300])
+        log.trace("QSO %d/%d full response: %s", i + 1, n, body)
 
         result = parse_response(body)
         check_result(result, log)
 
         if result.get("RESULT") == "OK":
-            count = result.get("COUNT", "?")
-            log.verbose("Chunk %d/%d: %s QSO(s) accepted", i + 1, n_chunks, count)
+            log.verbose("QSO %d/%d accepted (COUNT=%s)", i + 1, n, result.get("COUNT", "?"))
             try:
-                uploaded += int(count)
+                uploaded += int(result.get("COUNT", "0") or "0")
             except (ValueError, TypeError):
                 pass
         else:
-            log.error("Unexpected response for chunk %d/%d: %s", i + 1, n_chunks, body)
+            log.error("Unexpected response for QSO %d/%d: %s", i + 1, n, body)
             sys.exit(1)
 
-    log.info("Success: %d QSO(s) uploaded in %d chunk(s).", uploaded or len(records), n_chunks)
+    log.info("Success: %d of %d QSO(s) uploaded.", uploaded or n, n)
 
 
 FETCH_PAGE_SIZE = 250
@@ -457,51 +464,68 @@ def do_download(api_key: str, output_file: str, dry_run: bool, log: AppLogger) -
     log.verbose("Wrote %d bytes across %d page(s)", sum(len(c) for c in chunks), page)
 
 
-def do_save_config(config_path: str, api_key: str) -> None:
+def _save_config_value(config_path: str, section: str, key: str, value: str) -> None:
+    """Write a single key=value into a config section, creating file/section as needed."""
     cfg = configparser.ConfigParser()
     cfg.read(config_path)
-    if not cfg.has_section("qrzlog"):
-        cfg.add_section("qrzlog")
-    cfg.set("qrzlog", "api_key", api_key)
+    if not cfg.has_section(section):
+        cfg.add_section(section)
+    cfg.set(section, key, value)
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w") as f:
         cfg.write(f)
     os.chmod(config_path, 0o600)
-    print(f"API key saved to {config_path}")
 
 
 def main():
+    # Load default config and detect log file before building the parser so the
+    # status can appear in --help output.
+    _pre_cfg = load_config(DEFAULT_CONFIG)
+    _default_log = find_default_log_file(_pre_cfg)
+    if _default_log:
+        _log_hint = f"Default ADIF log: {_default_log} [found]"
+    else:
+        _log_hint = (f"Default ADIF log: not found"
+                     f" (checked {', '.join(WSJT_X_LOG_CANDIDATES)})")
+
     parser = argparse.ArgumentParser(
         prog="qrzlog",
         description="Upload or download ADIF logs via the QRZ Logbook API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            f"{_log_hint}\n\n"
             "API key: QRZ.com -> Logbook -> Settings -> API Key\n\n"
             "Config file format (~/.config/qrzlog/qrzlog.ini):\n"
             "  [qrzlog]\n"
-            "  api_key = YOUR_KEY_HERE\n\n"
+            "  api_key  = YOUR_KEY_HERE\n"
+            "  log_file = /path/to/wsjtx_log.adi\n\n"
             "  [logging]\n"
             "  level   = verbose    # trace | debug | verbose | info\n"
             "  logfile = /path/to/qrzlog.log\n"
             "  syslog  = false\n\n"
             "Examples:\n"
             "  qrzlog --save-key ABC123XYZ\n"
+            "  qrzlog --save-log-file ~/.local/share/WSJT-X/wsjtx_log.adi\n"
+            "  qrzlog --upload                    # uses configured/detected log file\n"
             "  qrzlog --upload contacts.adif\n"
-            "  qrzlog --upload contacts.adif --tail 50\n"
-            "  qrzlog --upload contacts.adif --tail-days 7\n"
-            "  qrzlog --upload contacts.adif --upload-chunk-size 50 --dry-run --trace\n"
+            "  qrzlog --upload --tail 50\n"
+            "  qrzlog --upload --tail-days 7\n"
+            "  qrzlog --upload --dry-run --trace\n"
             "  qrzlog --download mylog.adif\n"
             "  qrzlog --download mylog.adif --verbose\n"
             "  qrzlog --download mylog.adif --debug --logfile qrzlog.log\n"
-            "  qrzlog --upload contacts.adif --key ABC123XYZ\n"
             "  qrzlog --download mylog.adif --dry-run"
         ),
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--upload",   metavar="FILE",    help="Upload an ADIF file to QRZ Logbook")
-    mode.add_argument("--download", metavar="FILE",    help="Download your complete QRZ log to FILE")
-    mode.add_argument("--save-key", metavar="API_KEY", help="Save API key to config file and exit")
+    mode.add_argument(
+        "--upload", metavar="FILE", nargs="?", const="",
+        help="Upload ADIF to QRZ Logbook (FILE optional if default log configured or detected)",
+    )
+    mode.add_argument("--download",      metavar="FILE",    help="Download your complete QRZ log to FILE")
+    mode.add_argument("--save-key",      metavar="API_KEY", help="Save API key to config file and exit")
+    mode.add_argument("--save-log-file", metavar="FILE",    help="Save default ADIF log path to config and exit")
 
     parser.add_argument("--key",    metavar="API_KEY", help="QRZ API key (overrides config and QRZ_API_KEY env var)")
     parser.add_argument("--config", metavar="FILE", default=DEFAULT_CONFIG,
@@ -516,11 +540,6 @@ def main():
     parser.add_argument("--logfile", metavar="FILE",  help="Also write log output to FILE")
     parser.add_argument("--syslog",  action="store_true", help="Also send log output to syslog")
 
-    # Upload-specific options
-    parser.add_argument(
-        "--upload-chunk-size", metavar="N", type=int, default=DEFAULT_UPLOAD_CHUNK_SIZE,
-        help=f"QSOs per upload chunk (default: {DEFAULT_UPLOAD_CHUNK_SIZE})",
-    )
     tail_group = parser.add_mutually_exclusive_group()
     tail_group.add_argument("--tail",      metavar="N", type=int, help="Upload only the last N QSOs")
     tail_group.add_argument("--tail-days", metavar="N", type=int, help="Upload only QSOs from the last N days")
@@ -528,19 +547,23 @@ def main():
     args = parser.parse_args()
 
     # Validate upload-only flags
-    upload_only = {"upload_chunk_size": args.upload_chunk_size != DEFAULT_UPLOAD_CHUNK_SIZE,
-                   "tail": args.tail is not None,
-                   "tail_days": args.tail_days is not None}
-    if any(upload_only.values()) and not args.upload:
-        used = [f"--{k.replace('_', '-')}" for k, v in upload_only.items() if v]
+    if (args.tail is not None or args.tail_days is not None) and args.upload is None:
+        used = ["--tail" if args.tail is not None else "--tail-days"]
         parser.error(f"{', '.join(used)} can only be used with --upload")
 
-    # Load config early so logging options can be read from [logging] section
+    # Load actual config (may differ from DEFAULT_CONFIG if --config was passed)
     cfg = load_config(args.config)
     log = AppLogger.from_args(args, "qrzlog", cfg=cfg)
 
     if args.save_key:
-        do_save_config(args.config, args.save_key)
+        _save_config_value(args.config, "qrzlog", "api_key", args.save_key)
+        os.chmod(args.config, 0o600)
+        print(f"API key saved to {args.config}")
+        return
+
+    if args.save_log_file:
+        _save_config_value(args.config, "qrzlog", "log_file", args.save_log_file)
+        print(f"Default log file saved to {args.config}")
         return
 
     api_key = resolve_api_key(args, cfg)
@@ -551,13 +574,17 @@ def main():
             f"  qrzlog --save-key YOUR_KEY  (saves to {args.config})"
         )
 
-    if args.upload:
-        do_upload(
-            api_key or "", args.upload, args.dry_run, log,
-            chunk_size=args.upload_chunk_size,
-            tail=args.tail,
-            tail_days=args.tail_days,
-        )
+    if args.upload is not None:
+        # Resolve the actual file path: explicit arg > config/detected default
+        adif_file = args.upload or find_default_log_file(cfg)
+        if not adif_file:
+            parser.error(
+                "--upload: no FILE given and no default log file found.\n"
+                f"  Run: qrzlog --save-log-file /path/to/wsjtx_log.adi"
+            )
+        log.verbose("Using ADIF log file: %s", adif_file)
+        do_upload(api_key or "", adif_file, args.dry_run, log,
+                  tail=args.tail, tail_days=args.tail_days)
     elif args.download:
         do_download(api_key or "", args.download, args.dry_run, log)
 

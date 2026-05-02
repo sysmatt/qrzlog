@@ -32,21 +32,33 @@ qrzlog --key YOUR_KEY_HERE --upload contacts.adif
 
 Precedence: `--key` flag > `QRZ_API_KEY` environment variable > config file.
 
+## Default log file
+
+qrzlog automatically looks for a WSJT-X log at startup:
+
+```
+~/.local/share/WSJT-X/wsjtx_log.adi
+~/.local/share/WSJT-X/wsjtx_log.adif
+```
+
+If found, `--upload` can be used without specifying a file. To set a different default:
+
+```
+qrzlog --save-log-file /path/to/wsjtx_log.adi
+```
+
+This saves `log_file` to the `[qrzlog]` section of your config file. Run `--help` to see whether a default log file was detected.
+
 ## Usage
 
 ### Upload
 
 ```
-qrzlog --upload contacts.adif
+qrzlog --upload                    # uses configured or auto-detected log file
+qrzlog --upload contacts.adif     # explicit file
 ```
 
-Inserts QSOs from an ADIF file into your QRZ logbook. The file is parsed into
-individual records and sent in chunks (default 100 QSOs each) to avoid hitting
-server-side request size limits. Use `--upload-chunk-size` to tune the batch size.
-
-```
-qrzlog --upload contacts.adif --upload-chunk-size 50
-```
+Inserts QSOs from an ADIF file into your QRZ logbook. Each QSO is sent as an individual INSERT request (the QRZ API processes one record per call).
 
 To upload only a recent subset of a large log file:
 
@@ -55,11 +67,9 @@ qrzlog --upload contacts.adif --tail 100         # last 100 QSOs
 qrzlog --upload contacts.adif --tail-days 7      # QSOs from the last 7 days
 ```
 
-`--tail` and `--tail-days` are mutually exclusive. Records with no parseable
-`QSO_DATE` field are always kept when `--tail-days` is used (a warning is printed).
+`--tail` and `--tail-days` are mutually exclusive. Records with no parseable `QSO_DATE` field are always kept when `--tail-days` is used (a warning is printed).
 
-Use `--dry-run --trace` to preview exactly which records would be in each chunk
-before sending anything:
+Use `--dry-run --trace` to preview exactly which records would be sent before uploading anything:
 
 ```
 qrzlog --upload contacts.adif --tail-days 30 --dry-run --trace
@@ -109,9 +119,10 @@ qrzlog --download mylog.adif --debug --syslog
 
 | Flag | Description |
 |------|-------------|
-| `--upload FILE` | Upload an ADIF file to QRZ Logbook |
+| `--upload [FILE]` | Upload an ADIF file to QRZ Logbook (FILE optional if default configured/detected) |
 | `--download FILE` | Download your complete QRZ log to FILE |
 | `--save-key API_KEY` | Save API key to config file and exit |
+| `--save-log-file FILE` | Save default ADIF log path to config file and exit |
 | `--key API_KEY` | API key (overrides config and env var) |
 | `--config FILE` | Config file path (default: `~/.config/qrzlog/qrzlog.ini`) |
 | `--dry-run` | Show what would happen without making any requests |
@@ -120,7 +131,6 @@ qrzlog --download mylog.adif --debug --syslog
 | `--trace` | Show full untruncated responses (implies --debug) |
 | `--logfile FILE` | Also write log output to FILE |
 | `--syslog` | Also send log output to syslog |
-| `--upload-chunk-size N` | QSOs per upload chunk (default: 100) |
 | `--tail N` | Upload only the last N QSOs (upload only) |
 | `--tail-days N` | Upload only QSOs from the last N days (upload only) |
 
@@ -128,7 +138,8 @@ qrzlog --download mylog.adif --debug --syslog
 
 ```ini
 [qrzlog]
-api_key = YOUR_KEY_HERE
+api_key  = YOUR_KEY_HERE
+log_file = /path/to/wsjtx_log.adi
 
 [logging]
 level   = info      # trace | debug | verbose | info (default: info)
@@ -137,3 +148,5 @@ syslog  = false
 ```
 
 The `[logging]` section is optional. `level` sets the default verbosity without needing a command-line flag. Command-line flags (`--verbose`, `--debug`, `--trace`) always take precedence over the config file.
+
+`log_file` in `[qrzlog]` sets the default ADIF file used by `--upload` when no FILE argument is given. It takes precedence over the WSJT-X auto-detection paths.
