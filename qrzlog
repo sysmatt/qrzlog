@@ -318,8 +318,8 @@ def _fmt_time(t: str) -> str:
 
 
 def _qso_table_header() -> str:
-    header = "  ".join(h.ljust(w) for h, _, w in _UPLOAD_COLS)
-    sep    = "  ".join("-" * w     for _,  _, w in _UPLOAD_COLS)
+    header = "  ".join(h.ljust(w) for h, _, w in _UPLOAD_COLS) + "  STATUS"
+    sep    = "  ".join("-" * w     for _,  _, w in _UPLOAD_COLS) + "  ---------"
     return f"{header}\n{sep}"
 
 
@@ -433,7 +433,7 @@ def do_upload(
         log.info(_qso_table_header())
         for i, record in enumerate(records):
             adif = _build_adif(header, record)
-            log.info(_qso_table_row(record))
+            log.info("%s  -", _qso_table_row(record))
             log.verbose("  [dry-run] QSO %d/%d: %d bytes", i + 1, n, len(adif))
             log.trace("  [dry-run] QSO %d/%d content:\n%s", i + 1, n, adif)
         return
@@ -441,10 +441,10 @@ def do_upload(
     log.info("Uploading %d QSO(s) to %s\n", n, QRZ_API_URL)
     log.info(_qso_table_header())
     uploaded = 0
-    failed = 0
+    duplicates = 0
+    errors = 0
     for i, record in enumerate(records):
         adif = _build_adif(header, record)
-        log.info(_qso_table_row(record))
         log.verbose("  QSO %d/%d: %d bytes", i + 1, n, len(adif))
         log.trace("QSO %d/%d content:\n%s", i + 1, n, adif)
 
@@ -453,28 +453,46 @@ def do_upload(
         log.trace("QSO %d/%d full response: %s", i + 1, n, body)
 
         result = parse_response(body)
-        status = result.get("RESULT", "UNKNOWN")
+        api_status = result.get("RESULT", "UNKNOWN")
+        reason = result.get("REASON", "")
 
-        if status == "AUTH":
+        if api_status == "AUTH":
             log.error("Authentication failed — check your API key.")
             sys.exit(1)
-        elif status == "FAIL":
-            log.warning("QSO %d/%d skipped: %s", i + 1, n, result.get("REASON", "unknown reason"))
-            failed += 1
-        elif status == "OK":
-            log.verbose("QSO %d/%d accepted (COUNT=%s)", i + 1, n, result.get("COUNT", "?"))
+        elif api_status == "OK":
+            count = 0
             try:
-                uploaded += int(result.get("COUNT", "0") or "0")
+                count = int(result.get("COUNT", "0") or "0")
             except (ValueError, TypeError):
                 pass
+            if count == 0:
+                row_status = "Duplicate"
+                duplicates += 1
+            else:
+                row_status = "ADDED"
+                uploaded += count
+            log.verbose("  QSO %d/%d: COUNT=%s", i + 1, n, result.get("COUNT", "?"))
+        elif api_status == "FAIL" and "dup" in reason.lower():
+            row_status = "Duplicate"
+            duplicates += 1
+        elif api_status == "FAIL":
+            row_status = "FAILED"
+            errors += 1
         else:
-            log.warning("QSO %d/%d unexpected response, skipping: %s", i + 1, n, body)
-            failed += 1
+            row_status = "ERROR"
+            errors += 1
 
-    if failed:
-        log.info("Done: %d of %d QSO(s) uploaded, %d skipped.", uploaded, n, failed)
+        log.info("%s  %s", _qso_table_row(record), row_status)
+        if row_status == "FAILED":
+            log.info("  -> %s", reason or "unknown reason")
+        elif row_status == "ERROR":
+            log.info("  -> Unexpected response: %s", body[:200])
+
+    if duplicates or errors:
+        log.info("\nDone: %d uploaded, %d duplicate(s), %d error(s) of %d QSO(s).",
+                 uploaded, duplicates, errors, n)
     else:
-        log.info("Success: %d of %d QSO(s) uploaded.", uploaded or n, n)
+        log.info("\nSuccess: %d of %d QSO(s) uploaded.", uploaded or n, n)
 
 
 FETCH_PAGE_SIZE = 250

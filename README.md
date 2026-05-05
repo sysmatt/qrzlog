@@ -78,16 +78,27 @@ Header fields (Program, ADIF Ver, Created) are only shown when present in the fi
 Records:   1,234 total  ->  50 after filters
 ```
 
-Each QSO is then displayed in a formatted table as it is uploaded:
+Each QSO is displayed in a formatted table as it is uploaded, with a status column appended once the API responds:
 
 ```
-CALL        DATE        TIME   BAND   MODE    SENT   RCVD   GRID
-----------  ----------  -----  -----  ------  -----  -----  ------
-W1AW        2026-05-05  14:32  20m    FT8     -10    -12    FN31
-K1TTT       2026-05-04  22:15  40m    FT8     -05    -08    FN32
+CALL        DATE        TIME   BAND   MODE    SENT   RCVD   GRID    STATUS
+----------  ----------  -----  -----  ------  -----  -----  ------  ---------
+W1AW        2026-05-05  14:32  20m    FT8     -10    -12    FN31    ADDED
+K1TTT       2026-05-04  22:15  40m    FT8     -05    -08    FN32    Duplicate
+VK2XYZ      2026-05-03  08:47  15m    FT8     +02    -03    QF56    FAILED
+  -> Logbook full
 ```
 
-If an individual QSO fails (e.g. flagged as a duplicate by QRZ), a warning is printed and the upload continues with the remaining records. A final summary shows how many were uploaded vs. skipped.
+Status values:
+
+| Status | Meaning |
+|--------|---------|
+| `ADDED` | QSO accepted and inserted |
+| `Duplicate` | QRZ recognised it as already logged; skipped |
+| `FAILED` | API rejected the record; reason printed on the next line |
+| `ERROR` | Unexpected API response; raw response snippet printed on the next line |
+
+The upload always continues past individual failures. A final summary breaks down uploaded, duplicate, and error counts.
 
 To upload only a recent subset of a large log file:
 
@@ -120,7 +131,14 @@ qrzlog --upload contacts.adif --dry-run
 qrzlog --download mylog.adif --dry-run
 ```
 
-Shows what would happen without making any API requests. For uploads, the full file summary and QSO table are still printed so you can verify the records before committing.
+Shows what would happen without making any API requests. For uploads, the full file summary and QSO table are still printed so you can verify the records before committing. The STATUS column shows `-` since no API calls are made.
+
+```
+CALL        DATE        TIME   BAND   MODE    SENT   RCVD   GRID    STATUS
+----------  ----------  -----  -----  ------  -----  -----  ------  ---------
+W1AW        2026-05-05  14:32  20m    FT8     -10    -12    FN31    -
+K1TTT       2026-05-04  22:15  40m    FT8     -05    -08    FN32    -
+```
 
 ### Verbosity levels
 
