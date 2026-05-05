@@ -3,7 +3,7 @@
 
 import argparse
 import configparser
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import html
 import logging
 import logging.handlers
@@ -292,6 +292,86 @@ def _build_adif(header: str, record: str) -> str:
     return f"{header}\n{record}" if header else record
 
 
+_UPLOAD_COLS = [
+    ("CALL",  "CALL",        10),
+    ("DATE",  "QSO_DATE",    10),
+    ("TIME",  "TIME_ON",      5),
+    ("BAND",  "BAND",         5),
+    ("MODE",  "MODE",         6),
+    ("SENT",  "RST_SENT",     5),
+    ("RCVD",  "RST_RCVD",     5),
+    ("GRID",  "GRIDSQUARE",   6),
+]
+
+
+def _adif_field(record: str, field: str) -> str:
+    m = re.search(rf"<{re.escape(field)}:\d+(?::\w)?>([^<]*)", record, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _fmt_date(d: str) -> str:
+    return f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
+
+
+def _fmt_time(t: str) -> str:
+    return f"{t[:2]}:{t[2:4]}" if len(t) >= 4 else t
+
+
+def _qso_table_header() -> str:
+    header = "  ".join(h.ljust(w) for h, _, w in _UPLOAD_COLS)
+    sep    = "  ".join("-" * w     for _,  _, w in _UPLOAD_COLS)
+    return f"{header}\n{sep}"
+
+
+def _qso_table_row(record: str) -> str:
+    parts = []
+    for _, field, width in _UPLOAD_COLS:
+        val = _adif_field(record, field)
+        if field == "QSO_DATE":
+            val = _fmt_date(val)
+        elif field == "TIME_ON":
+            val = _fmt_time(val)
+        parts.append(val.ljust(width)[:width])
+    return "  ".join(parts)
+
+
+def _log_adif_stats(log: AppLogger, adif_file: str, total: int, showing: int, header: str) -> None:
+    stat  = os.stat(adif_file)
+    size  = stat.st_size
+    mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    if size >= 1_048_576:
+        size_hr = f"{size / 1_048_576:.1f} MB"
+    elif size >= 1_024:
+        size_hr = f"{size / 1_024:.1f} KB"
+    else:
+        size_hr = f"{size} B"
+
+    log.info("File:      %s", adif_file)
+    log.info("Size:      %s  (%s bytes)", size_hr, f"{size:,}")
+    log.info("Modified:  %s", mtime)
+    if showing < total:
+        log.info("Records:   %s total  ->  %s after filters", f"{total:,}", f"{showing:,}")
+    else:
+        log.info("Records:   %s", f"{total:,}")
+
+    if header:
+        hdr = {}
+        for m in re.finditer(r"<(\w+):(\d+)(?::\w)?>([^<]*)", header, re.IGNORECASE):
+            fname, flen, fval = m.group(1).upper(), int(m.group(2)), m.group(3)
+            hdr[fname] = fval[:flen].strip()
+        if "PROGRAMID" in hdr or "PROGRAMVERSION" in hdr:
+            prog = hdr.get("PROGRAMID", "")
+            ver  = hdr.get("PROGRAMVERSION", "")
+            log.info("Program:   %s", f"{prog}  {ver}".strip() if ver else prog)
+        if "ADIF_VER" in hdr:
+            log.info("ADIF Ver:  %s", hdr["ADIF_VER"])
+        if "CREATED_TIMESTAMP" in hdr:
+            log.info("Created:   %s", hdr["CREATED_TIMESTAMP"])
+
+    log.info("")
+
+
 def do_upload(
     api_key: str,
     adif_file: str,
@@ -316,6 +396,7 @@ def do_upload(
     if eor_count == 0:
         log.warning("No <EOR> record terminators found in %s — file may be non-standard ADIF", adif_file)
     log.verbose("Parsed %d QSO(s) from %s (%d <EOR> tags)", len(records), adif_file, eor_count)
+    total_records = len(records)
 
     # Apply filters
     if tail_days is not None:
@@ -345,20 +426,26 @@ def do_upload(
         sys.exit(1)
 
     n = len(records)
+    _log_adif_stats(log, adif_file, total_records, n, header)
 
     if dry_run:
-        log.info("[dry-run] Would upload %d QSO(s) in %d INSERT call(s) to %s", n, n, QRZ_API_URL)
+        log.info("[dry-run] Would upload %d QSO(s) to %s\n", n, QRZ_API_URL)
+        log.info(_qso_table_header())
         for i, record in enumerate(records):
             adif = _build_adif(header, record)
-            log.verbose("[dry-run] QSO %d/%d: %d bytes", i + 1, n, len(adif))
-            log.trace("[dry-run] QSO %d/%d content:\n%s", i + 1, n, adif)
+            log.info(_qso_table_row(record))
+            log.verbose("  [dry-run] QSO %d/%d: %d bytes", i + 1, n, len(adif))
+            log.trace("  [dry-run] QSO %d/%d content:\n%s", i + 1, n, adif)
         return
 
+    log.info("Uploading %d QSO(s) to %s\n", n, QRZ_API_URL)
+    log.info(_qso_table_header())
     uploaded = 0
+    failed = 0
     for i, record in enumerate(records):
         adif = _build_adif(header, record)
-        log.info("Uploading QSO %d/%d...", i + 1, n)
-        log.verbose("QSO %d/%d: %d bytes", i + 1, n, len(adif))
+        log.info(_qso_table_row(record))
+        log.verbose("  QSO %d/%d: %d bytes", i + 1, n, len(adif))
         log.trace("QSO %d/%d content:\n%s", i + 1, n, adif)
 
         body = qrz_post({"KEY": api_key, "ACTION": "INSERT", "ADIF": adif}, log)
@@ -366,19 +453,28 @@ def do_upload(
         log.trace("QSO %d/%d full response: %s", i + 1, n, body)
 
         result = parse_response(body)
-        check_result(result, log)
+        status = result.get("RESULT", "UNKNOWN")
 
-        if result.get("RESULT") == "OK":
+        if status == "AUTH":
+            log.error("Authentication failed — check your API key.")
+            sys.exit(1)
+        elif status == "FAIL":
+            log.warning("QSO %d/%d skipped: %s", i + 1, n, result.get("REASON", "unknown reason"))
+            failed += 1
+        elif status == "OK":
             log.verbose("QSO %d/%d accepted (COUNT=%s)", i + 1, n, result.get("COUNT", "?"))
             try:
                 uploaded += int(result.get("COUNT", "0") or "0")
             except (ValueError, TypeError):
                 pass
         else:
-            log.error("Unexpected response for QSO %d/%d: %s", i + 1, n, body)
-            sys.exit(1)
+            log.warning("QSO %d/%d unexpected response, skipping: %s", i + 1, n, body)
+            failed += 1
 
-    log.info("Success: %d of %d QSO(s) uploaded.", uploaded or n, n)
+    if failed:
+        log.info("Done: %d of %d QSO(s) uploaded, %d skipped.", uploaded, n, failed)
+    else:
+        log.info("Success: %d of %d QSO(s) uploaded.", uploaded or n, n)
 
 
 FETCH_PAGE_SIZE = 250

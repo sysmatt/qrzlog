@@ -60,6 +60,35 @@ qrzlog --upload contacts.adif     # explicit file
 
 Inserts QSOs from an ADIF file into your QRZ logbook. Each QSO is sent as an individual INSERT request (the QRZ API processes one record per call).
 
+Before uploading, a summary of the ADIF file is printed:
+
+```
+File:      /home/user/.local/share/WSJT-X/wsjtx_log.adi
+Size:      142.3 KB  (145,718 bytes)
+Modified:  2026-05-05 14:32:18
+Records:   1,234
+Program:   WSJT-X  2.7.1
+ADIF Ver:  3.1.4
+Created:   20260505 143218
+```
+
+Header fields (Program, ADIF Ver, Created) are only shown when present in the file. When `--tail` or `--tail-days` filters are active, the Records line shows both the total and the filtered count:
+
+```
+Records:   1,234 total  ->  50 after filters
+```
+
+Each QSO is then displayed in a formatted table as it is uploaded:
+
+```
+CALL        DATE        TIME   BAND   MODE    SENT   RCVD   GRID
+----------  ----------  -----  -----  ------  -----  -----  ------
+W1AW        2026-05-05  14:32  20m    FT8     -10    -12    FN31
+K1TTT       2026-05-04  22:15  40m    FT8     -05    -08    FN32
+```
+
+If an individual QSO fails (e.g. flagged as a duplicate by QRZ), a warning is printed and the upload continues with the remaining records. A final summary shows how many were uploaded vs. skipped.
+
 To upload only a recent subset of a large log file:
 
 ```
@@ -69,10 +98,11 @@ qrzlog --upload contacts.adif --tail-days 7      # QSOs from the last 7 days
 
 `--tail` and `--tail-days` are mutually exclusive. Records with no parseable `QSO_DATE` field are always kept when `--tail-days` is used (a warning is printed).
 
-Use `--dry-run --trace` to preview exactly which records would be sent before uploading anything:
+Use `--dry-run` to preview the file summary and QSO table without making any API requests:
 
 ```
-qrzlog --upload contacts.adif --tail-days 30 --dry-run --trace
+qrzlog --upload contacts.adif --tail-days 30 --dry-run
+qrzlog --upload contacts.adif --tail-days 30 --dry-run --trace   # also dumps raw ADIF
 ```
 
 ### Download
@@ -90,7 +120,7 @@ qrzlog --upload contacts.adif --dry-run
 qrzlog --download mylog.adif --dry-run
 ```
 
-Shows what would happen without making any API requests.
+Shows what would happen without making any API requests. For uploads, the full file summary and QSO table are still printed so you can verify the records before committing.
 
 ### Verbosity levels
 
